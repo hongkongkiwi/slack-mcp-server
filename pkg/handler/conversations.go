@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"html"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gocarina/gocsv"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider"
@@ -25,6 +27,10 @@ import (
 const (
 	defaultConversationsNumericLimit    = 50
 	defaultConversationsExpressionLimit = "1d"
+	// Security limits for message content
+	maxMessageLength = 40000 // Slack's actual limit
+	maxChannelNameLength = 80
+	maxThreadTsLength = 32
 )
 
 var validFilterKeys = map[string]struct{}{
@@ -340,26 +346,146 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	return marshalMessagesToCSV(messages)
 }
 
+// sanitizeMessageContent sanitizes message content to prevent injection attacks
+func sanitizeMessageContent(content, contentType string) (string, error) {
+	if !utf8.ValidString(content) {
+		return "", errors.New("message content contains invalid UTF-8 sequences")
+	}
+
+	if len(content) > maxMessageLength {
+		return "", fmt.Errorf("message content exceeds maximum length of %d characters", maxMessageLength)
+	}
+
+	// For markdown content, escape any HTML to prevent XSS if rendered in web context
+	if contentType == "text/markdown" {
+		content = html.EscapeString(content)
+	}
+
+	return content, nil
+}
+
+// validateChannelIdentifier validates and sanitizes channel identifiers
+func validateChannelIdentifier(channelID string) error {
+	if channelID == "" {
+		return errors.New("channel identifier cannot be empty")
+	}
+
+	if len(channelID) > maxChannelNameLength {
+		return fmt.Errorf("channel identifier exceeds maximum length of %d characters", maxChannelNameLength)
+	}
+
+	if !utf8.ValidString(channelID) {
+		return errors.New("channel identifier contains invalid UTF-8 sequences")
+	}
+
+	// Validate channel ID format (Slack channel IDs start with C, D, or G followed by alphanumeric)
+	if !strings.HasPrefix(channelID, "#") && !strings.HasPrefix(channelID, "@") {
+		if !regexp.MustCompile(`^[CDG][A-Z0-9]{8,}$`).MatchString(channelID) {
+			return errors.New("invalid channel ID format")
+		}
+	}
+
+	return nil
+}
+
+// validateThreadTimestamp validates thread timestamp format and length
+func validateThreadTimestamp(threadTs string) error {
+	if threadTs == "" {
+		return nil
+	}
+
+	if len(threadTs) > maxThreadTsLength {
+		return fmt.Errorf("thread timestamp exceeds maximum length of %d characters", maxThreadTsLength)
+	}
+
+	if !strings.Contains(threadTs, ".") {
+		return errors.New("thread_ts must be a valid timestamp in format 1234567890.123456")
+	}
+
+	// Additional format validation
+	if !regexp.MustCompile(`^\d{10}\.\d{6}$`).MatchString(threadTs) {
+		return errors.New("thread_ts must be a valid timestamp in format 1234567890.123456")
+	}
+
+	return nil
+}
+
+// secureChannelResolution securely resolves channel names to IDs with additional validation
+func (ch *ConversationsHandler) secureChannelResolution(channelInput string) (string, error) {
+	// First validate the input
+	if err := validateChannelIdentifier(channelInput); err != nil {
+		return "", fmt.Errorf("invalid channel identifier: %w", err)
+	}
+
+	// If it's already a channel ID, return as-is
+	if !strings.HasPrefix(channelInput, "#") && !strings.HasPrefix(channelInput, "@") {
+		return channelInput, nil
+	}
+
+	// Resolve channel name to ID
+	channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	chn, ok := channelsMaps.ChannelsInv[channelInput]
+	if !ok {
+		ch.logger.Warn("Channel name resolution failed", 
+			zap.String("requested_channel", channelInput),
+			zap.String("context", "security"))
+		return "", fmt.Errorf("channel %q not found", channelInput)
+	}
+
+	resolvedID := channelsMaps.Channels[chn].ID
+	
+	// Validate that the resolved ID is a proper channel ID
+	if err := validateChannelIdentifier(resolvedID); err != nil {
+		ch.logger.Error("Resolved channel ID failed validation",
+			zap.String("requested_channel", channelInput),
+			zap.String("resolved_id", resolvedID),
+			zap.Error(err),
+			zap.String("context", "security"))
+		return "", fmt.Errorf("resolved channel ID is invalid: %w", err)
+	}
+
+	// Additional security check: verify the resolved channel is allowed
+	if !isChannelAllowed(resolvedID) {
+		ch.logger.Warn("Resolved channel is not in allowed list",
+			zap.String("requested_channel", channelInput),
+			zap.String("resolved_id", resolvedID),
+			zap.String("context", "security"))
+		return "", fmt.Errorf("resolved channel %q is not allowed by current policy", resolvedID)
+	}
+
+	return resolvedID, nil
+}
+
 func isChannelAllowed(channel string) bool {
 	config := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL")
-	if config == "" || config == "true" || config == "1" {
+	if config == "" {
+		return false // More secure default - require explicit configuration
+	}
+	if config == "true" || config == "1" {
 		return true
 	}
 	items := strings.Split(config, ",")
 	isNegated := strings.HasPrefix(strings.TrimSpace(items[0]), "!")
-	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if isNegated {
+	
+	if isNegated {
+		// Blacklist mode: allow all except listed channels
+		for _, item := range items {
+			item = strings.TrimSpace(item)
 			if strings.TrimPrefix(item, "!") == channel {
 				return false
 			}
-		} else {
+		}
+		return true // Not in blacklist, so allowed
+	} else {
+		// Whitelist mode: only allow listed channels
+		for _, item := range items {
+			item = strings.TrimSpace(item)
 			if item == channel {
 				return true
 			}
 		}
+		return false // Not in whitelist, so denied
 	}
-	return !isNegated
 }
 
 func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool) []Message {
@@ -543,24 +669,25 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 		ch.logger.Error("channel_id missing in add-message params")
 		return nil, errors.New("channel_id must be a string")
 	}
-	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
-		chn, ok := channelsMaps.ChannelsInv[channel]
-		if !ok {
-			ch.logger.Error("Channel not found", zap.String("channel", channel))
-			return nil, fmt.Errorf("channel %q not found", channel)
-		}
-		channel = channelsMaps.Channels[chn].ID
+
+	// Use secure channel resolution with proper validation
+	resolvedChannel, err := ch.secureChannelResolution(channel)
+	if err != nil {
+		ch.logger.Error("Channel resolution failed", 
+			zap.String("requested_channel", channel), 
+			zap.Error(err),
+			zap.String("context", "security"))
+		return nil, fmt.Errorf("channel resolution failed: %w", err)
 	}
-	if !isChannelAllowed(channel) {
-		ch.logger.Warn("Add-message tool not allowed for channel", zap.String("channel", channel), zap.String("policy", toolConfig))
-		return nil, fmt.Errorf("conversations_add_message tool is not allowed for channel %q, applied policy: %s", channel, toolConfig)
-	}
+	channel = resolvedChannel
 
 	threadTs := request.GetString("thread_ts", "")
-	if threadTs != "" && !strings.Contains(threadTs, ".") {
-		ch.logger.Error("Invalid thread_ts format", zap.String("thread_ts", threadTs))
-		return nil, errors.New("thread_ts must be a valid timestamp in format 1234567890.123456")
+	if err := validateThreadTimestamp(threadTs); err != nil {
+		ch.logger.Error("Invalid thread_ts", 
+			zap.String("thread_ts", threadTs), 
+			zap.Error(err),
+			zap.String("context", "security"))
+		return nil, fmt.Errorf("thread timestamp validation failed: %w", err)
 	}
 
 	msgText := request.GetString("payload", "")
@@ -574,6 +701,18 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 		ch.logger.Error("Invalid content_type", zap.String("content_type", contentType))
 		return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
 	}
+
+	// Sanitize message content for security
+	sanitizedText, err := sanitizeMessageContent(msgText, contentType)
+	if err != nil {
+		ch.logger.Error("Message content validation failed", 
+			zap.Error(err),
+			zap.Int("content_length", len(msgText)),
+			zap.String("content_type", contentType),
+			zap.String("context", "security"))
+		return nil, fmt.Errorf("message content validation failed: %w", err)
+	}
+	msgText = sanitizedText
 
 	return &addMessageParams{
 		channel:     channel,
